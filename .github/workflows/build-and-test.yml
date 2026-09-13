@@ -1,0 +1,748 @@
+name: Build & Test
+
+on:
+  repository_dispatch:
+    types: [build-and-test]
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Dispatch state job ID (UUID from dispatch-state repo)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      SCHEME_NAME: ${{ secrets.SCHEME_NAME }}
+      BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+
+    steps:
+      - name: Parse dispatch payload
+        env:
+          PROXY_PAT: ${{ secrets.PROXY_PAT }}
+          WORKFLOW_JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          set -euo pipefail
+
+          # Extract fallback fields from payload for status reporting if state fetch fails
+          fallback_project_id="$(jq -r '.client_payload.project_id // empty' "$GITHUB_EVENT_PATH")"
+          fallback_sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
+          set_fallback_env() {
+            if [ -n "$fallback_project_id" ] && printf '%s' "$fallback_project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+              echo "::add-mask::$fallback_project_id"
+              echo "PROJECT_ID=$fallback_project_id" >> "$GITHUB_ENV"
+            fi
+            if [ -n "$fallback_sha" ] && printf '%s' "$fallback_sha" | LC_ALL=C grep -Eq '^[0-9a-f]{7,40}$'; then
+              echo "::add-mask::$fallback_sha"
+              echo "SHA=$fallback_sha" >> "$GITHUB_ENV"
+            fi
+          }
+
+          job_id="$(jq -r '.client_payload.job_id // empty' "$GITHUB_EVENT_PATH")"
+          if [ -z "$job_id" ]; then
+            job_id="$WORKFLOW_JOB_ID"
+          fi
+
+          if [ -z "$job_id" ]; then
+            echo "Missing job_id in dispatch payload"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$job_id" | LC_ALL=C grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "Invalid job_id format"
+            set_fallback_env
+            exit 1
+          fi
+
+          state_url="https://api.github.com/repos/ttlgitproxy/dispatch-state/contents/${job_id}.json"
+
+          if [ -z "${PROXY_PAT:-}" ]; then
+            echo "PROXY_PAT secret is unset or empty — cannot authenticate to dispatch-state repo"
+            set_fallback_env
+            exit 1
+          fi
+
+          state_body_file="dispatch-state-response.json"
+          trap 'rm -f "$state_body_file"' EXIT
+          curl_rc=0
+          http_status="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS \
+            -H "Authorization: token ${PROXY_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            -o "$state_body_file" \
+            -w '%{http_code}' \
+            "$state_url")" || curl_rc=$?
+
+          if [ "$http_status" = "000" ]; then
+            echo "Dispatch state fetch did not complete (transport/DNS failure; HTTP 000) — check network and re-run."
+            set_fallback_env
+            exit 1
+          elif [ "$curl_rc" -ne 0 ]; then
+            echo "Dispatch state fetch returned HTTP ${http_status} but transfer did not complete (curl exit ${curl_rc}) — response body may be truncated. This is not a confirmed token or permission failure; check network stability and re-run."
+            set_fallback_env
+            exit 1
+          elif [ "$http_status" = "401" ]; then
+            echo "Dispatch state fetch returned HTTP 401 — PROXY_PAT secret is stale or revoked. Rotate the secret."
+            set_fallback_env
+            exit 1
+          elif [ "$http_status" = "403" ]; then
+            # Distinguish rate-limit (transient) from permission denial (credential problem).
+            # GitHub sets a rate-limit message in the JSON body; extract a short token without echoing raw content.
+            rate_limited="no"
+            if [ -f "$state_body_file" ] && grep -qi "rate limit" "$state_body_file" 2>/dev/null; then
+              rate_limited="yes"
+            fi
+            if [ "$rate_limited" = "yes" ]; then
+              echo "Dispatch state fetch returned HTTP 403 — GitHub rate limit exceeded. This is transient; re-run the workflow."
+            else
+              echo "Dispatch state fetch returned HTTP 403 — PROXY_PAT may lack contents:read on ttlgitproxy/dispatch-state, but this status also occurs from WAF/proxy blocks, organization IP-allowlist enforcement, or SAML/SSO requirements. Check PAT scopes and org settings before rotating the secret."
+            fi
+            set_fallback_env
+            exit 1
+          elif [ "$http_status" = "429" ]; then
+            echo "Dispatch state fetch returned HTTP 429 — GitHub rate limit exceeded. This is transient; re-run the workflow."
+            set_fallback_env
+            exit 1
+          elif [ "$http_status" = "404" ]; then
+            probe_rc=0
+            probe_status="$(curl --max-time 10 -sS \
+              -H "Authorization: token ${PROXY_PAT}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -o /dev/null -w '%{http_code}' \
+              "https://api.github.com/repos/ttlgitproxy/dispatch-state/contents/")" || probe_rc=$?
+            if [ "$probe_rc" -ne 0 ] && [ "$probe_status" != "000" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP ${probe_status} but transfer did not complete (curl exit ${probe_rc}). Cause is ambiguous; check network stability and re-run."
+            elif [ "$probe_status" = "200" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — PROXY_PAT can read the repo contents; file was never written or was already consumed. Check that the dispatch workflow uploaded the state file before triggering this run."
+            elif [ "$probe_status" = "000" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe did not complete (transport/DNS failure; HTTP 000). Cause is ambiguous: file may be missing/consumed, or PROXY_PAT may lack access. Check PAT scopes and re-run."
+            elif [ "$probe_status" = "429" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP 429 (rate limit). Cause is ambiguous; re-run the workflow."
+            elif [ "$(printf '%s' "$probe_status" | cut -c1)" = "5" ]; then
+              echo "Dispatch state file not found (HTTP 404) for job ${job_id} — contents probe returned HTTP ${probe_status} (GitHub service failure). This is transient; re-run the workflow."
+            elif [ "$probe_status" = "401" ]; then
+              echo "Dispatch state fetch returned HTTP 404 for job ${job_id}, and contents probe returned HTTP 401 — PROXY_PAT is invalid or expired. Rotate PROXY_PAT."
+            else
+              echo "Dispatch state fetch returned HTTP 404 for job ${job_id}, and contents probe returned HTTP ${probe_status} — cause is not confirmed; PROXY_PAT may lack contents:read, or an org/SSO/IP policy may be blocking access. Check PAT scopes and org settings before rotating."
+            fi
+            set_fallback_env
+            exit 1
+          elif [ "$(printf '%s' "$http_status" | cut -c1)" = "5" ]; then
+            echo "Dispatch state fetch returned HTTP ${http_status} — GitHub service failure. This is transient; re-run the workflow."
+            set_fallback_env
+            exit 1
+          elif [ "$http_status" != "200" ]; then
+            echo "Dispatch state fetch returned unexpected HTTP ${http_status} for job ${job_id}"
+            set_fallback_env
+            exit 1
+          fi
+
+          state_response="$(cat "$state_body_file")" || {
+            echo "Failed to read dispatch state response file for job ${job_id} — unexpected I/O error"
+            set_fallback_env
+            exit 1
+          }
+          rm -f "$state_body_file"
+          trap - EXIT
+
+          file_sha="$(printf '%s' "$state_response" | jq -r '.sha // empty')" || {
+            echo "Failed to parse .sha from dispatch state response for job ${job_id} — body may be non-JSON or malformed"
+            set_fallback_env
+            exit 1
+          }
+          encoded_content="$(printf '%s' "$state_response" | jq -r '.content // empty')" || {
+            echo "Failed to parse .content from dispatch state response for job ${job_id} — body may be non-JSON or malformed"
+            set_fallback_env
+            exit 1
+          }
+
+          if [ -z "$file_sha" ] || [ -z "$encoded_content" ]; then
+            echo "Dispatch state response missing .sha or .content fields for job ${job_id} — unexpected API response shape"
+            set_fallback_env
+            exit 1
+          fi
+
+          echo "::add-mask::$file_sha"
+
+          state_json="$(printf '%s' "$encoded_content" | tr -d '\n' | /usr/bin/base64 -D)" || {
+            echo "Failed to decode .content field for job ${job_id} — field was not valid base64. Response body may be malformed or proxy-modified."
+            set_fallback_env
+            exit 1
+          }
+
+          if ! printf '%s' "$state_json" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            state_json_type="$(printf '%s' "$state_json" | jq -r 'type' 2>/dev/null || echo 'unknown')"
+            echo "Decoded .content for job ${job_id} is not a JSON object (got type: ${state_json_type}) — dispatch state payload was malformed or proxy-modified. Check that the dispatch workflow wrote a valid state file."
+            set_fallback_env
+            exit 1
+          fi
+
+          ref="$(printf '%s' "$state_json" | jq -r '.ref // empty')"
+          sha="$(printf '%s' "$state_json" | jq -r '.sha // empty')"
+          project_id="$(printf '%s' "$state_json" | jq -r '.project_id // empty')"
+          merge_request_iid="$(printf '%s' "$state_json" | jq -r '.mr_iid // empty')"
+
+          event_type="$(printf '%s' "$state_json" | jq -r '.event_type // empty')"
+          if [ "$event_type" != "build-and-test" ]; then
+            echo "State file event_type mismatch (expected build-and-test)"
+            set_fallback_env
+            exit 1
+          fi
+
+          delete_payload="$(jq -n \
+            --arg message "consumed dispatch state for job ${job_id}" \
+            --arg file_sha "$file_sha" \
+            '{message: $message, sha: $file_sha}')"
+
+          curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null \
+            -X DELETE \
+            -H "Authorization: token ${PROXY_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$state_url" \
+            -d "$delete_payload" || echo "⚠️ Failed to delete state file — continuing"
+
+          if [ -z "$ref" ] || [ -z "$sha" ]; then
+            echo "Missing ref or sha in dispatch state"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$ref" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "Invalid ref format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$sha" | LC_ALL=C grep -Eq '^[0-9a-f]{7,40}$'; then
+            echo "Invalid sha format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -n "$project_id" ] && ! printf '%s' "$project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+            echo "Invalid project_id format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -n "$merge_request_iid" ] && ! printf '%s' "$merge_request_iid" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+            echo "Invalid merge_request_iid format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -n "$ref" ]; then echo "::add-mask::$ref"; fi
+          if [ -n "$sha" ]; then echo "::add-mask::$sha"; fi
+          if [ -n "$project_id" ]; then echo "::add-mask::$project_id"; fi
+          if [ -n "$merge_request_iid" ]; then echo "::add-mask::$merge_request_iid"; fi
+
+          {
+            echo "REF<<__REF_EOF__"
+            printf '%s' "$ref"
+            echo
+            echo "__REF_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "SHA<<__SHA_EOF__"
+            printf '%s' "$sha"
+            echo
+            echo "__SHA_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "PROJECT_ID<<__PROJECT_ID_EOF__"
+            printf '%s' "$project_id"
+            echo
+            echo "__PROJECT_ID_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "MERGE_REQUEST_IID<<__MERGE_REQUEST_IID_EOF__"
+            printf '%s' "$merge_request_iid"
+            echo
+            echo "__MERGE_REQUEST_IID_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Clone source repository
+        env:
+          SOURCE_REPOSITORY_URL: ${{ secrets.SOURCE_REPOSITORY_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SOURCE_REPOSITORY_URL" ]; then
+            echo "SOURCE_REPOSITORY_URL secret is required"
+            exit 1
+          fi
+
+          echo "::add-mask::$SOURCE_REPOSITORY_URL"
+
+          git clone --depth 1 --branch "$REF" "$SOURCE_REPOSITORY_URL" source 2>/dev/null || {
+            git clone "$SOURCE_REPOSITORY_URL" source 2>/dev/null
+            cd source
+            git checkout --detach "$SHA" > /dev/null 2>&1
+          }
+
+      - name: Prefetch Danger base ref, then scrub clone credential (hardening)
+        working-directory: source
+        run: |
+          set -euo pipefail
+          # Fetch the Danger base ref WHILE the clone credential is still present…
+          export DANGER_BASE_REF="${DANGER_BASE_REF:-main}"
+          git fetch --depth=100 origin "$DANGER_BASE_REF" 2>/dev/null || \
+            echo "⚠️  base prefetch failed — Danger diff may be empty"
+          # …then strip the embedded credential from origin, keeping .git history for Danger.
+          clean_url="$(git remote get-url origin | sed -E 's#^(https?://)[^@/]+@#\1#')"
+          git remote set-url origin "$clean_url"
+          echo "🔒 Clone credential scrubbed from origin (history retained for Danger)"
+
+      - name: Report pending status
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "No project id provided; skipping pending status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "⚠️ SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null -w '%{http_code}' -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=running" --data-urlencode "target_url=${run_url}" --data-urlencode "description=Build and test in progress" --data-urlencode "name=ci/proxy" 2>/dev/null)"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "⚠️ Pending status update failed with HTTP ${http_code} — continuing anyway"
+            exit 0
+          fi
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+
+          xcode_path="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | LC_ALL=C sort | tail -1)"
+          if [ -z "$xcode_path" ]; then
+            echo "No Xcode installation found"
+            exit 1
+          fi
+
+          sudo xcode-select -s "$xcode_path/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: source
+        run: |
+          set -euo pipefail
+          xcodegen generate > /dev/null 2>&1
+
+      # ── Quality gates (advisory phase) ─────────────────────────────────
+      # All gate steps use continue-on-error: true — they report violation
+      # counts to the log but do NOT fail the build in this first pass.
+      # ─────────────────────────────────────────────────────────────────────
+
+      - name: Install Swift quality gate tools
+        run: |
+          brew install swiftlint || echo "⚠️ swiftlint install failed (non-blocking)"
+          brew install swiftformat || echo "⚠️ swiftformat install failed (non-blocking)"
+          brew install peripheryapp/periphery/periphery 2>/dev/null || \
+            echo "⚠️ periphery install failed (non-blocking)"
+          brew install danger/tap/danger-swift 2>/dev/null || \
+            echo "⚠️ danger-swift install failed (non-blocking)"
+          echo "✅ Gate tool installation complete"
+
+      - name: SwiftLint (advisory)
+        working-directory: source
+        continue-on-error: true
+        run: |
+          if ! command -v swiftlint &>/dev/null; then
+            echo "⚠️  swiftlint not available — skipping"
+            exit 0
+          fi
+          LINT_JSON=$(swiftlint lint --reporter json 2>/dev/null || true)
+          WARN=$(printf '%s' "$LINT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for v in d if v.get('severity')=='Warning'))" 2>/dev/null || echo "?")
+          ERRS=$(printf '%s' "$LINT_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for v in d if v.get('severity')=='Error'))" 2>/dev/null || echo "?")
+          echo "📊 SwiftLint: ${WARN} warnings, ${ERRS} errors (advisory — non-blocking)"
+
+      - name: SwiftFormat lint (advisory)
+        working-directory: source
+        continue-on-error: true
+        run: |
+          if ! command -v swiftformat &>/dev/null; then
+            echo "⚠️  swiftformat not available — skipping"
+            exit 0
+          fi
+          swiftformat --lint . >/dev/null 2>/dev/null && \
+            echo "✅ SwiftFormat: no formatting issues" || \
+            echo "📊 SwiftFormat: files require formatting (advisory — non-blocking)"
+
+      - name: Periphery dead-code scan (advisory)
+        working-directory: source
+        continue-on-error: true
+        run: |
+          if ! command -v periphery &>/dev/null; then
+            echo "⚠️  periphery not available — skipping"
+            exit 0
+          fi
+          PERI_OUTPUT=$(periphery scan 2>/dev/null || true)
+          PERI_COUNT=$(printf '%s' "$PERI_OUTPUT" | grep -c '\.swift:' || echo "0")
+          echo "📊 Periphery: ${PERI_COUNT} dead-code findings (advisory — non-blocking)"
+
+      - name: Danger changeset rules (advisory)
+        working-directory: source
+        continue-on-error: true
+        run: |
+          export DANGER_BASE_REF="${DANGER_BASE_REF:-main}"
+          # base ref was prefetched right after clone (before the credential was scrubbed)
+          if ! command -v danger-swift &>/dev/null; then
+            echo "⚠️  danger-swift not available — skipping"
+            exit 0
+          fi
+          DANGER_RESULT=0
+          danger-swift local --base "origin/${DANGER_BASE_REF}" >/dev/null 2>&1 || DANGER_RESULT=$?
+          if [ "$DANGER_RESULT" -eq 0 ]; then
+            echo "✅ Danger: all changeset rules passed (advisory)"
+          else
+            echo "📊 Danger: changeset check failed (advisory — non-blocking; details withheld)"
+          fi
+
+      # ── End quality gates ─────────────────────────────────────────────────
+
+      - name: Find simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+
+          simulator_id="$(python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          try:
+              result = subprocess.run(
+                  ["xcrun", "simctl", "list", "devices", "available", "-j"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+          except subprocess.CalledProcessError:
+              print("Failed to list available simulators", file=sys.stderr)
+              sys.exit(1)
+
+          devices = json.loads(result.stdout).get("devices", {})
+
+          for runtime_devices in devices.values():
+              for device in runtime_devices:
+                  if device.get("isAvailable") and "iPhone" in device.get("name", ""):
+                      print(device.get("udid", ""))
+                      sys.exit(0)
+          PY
+          )"
+
+          if [ -z "$simulator_id" ]; then
+            echo "No available iPhone simulator found"
+            exit 1
+          fi
+
+          if ! printf '%s' "$simulator_id" | grep -Eq '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$'; then
+            echo "simulator_id is not a valid UUID"
+            exit 1
+          fi
+
+          echo "::add-mask::$simulator_id"
+
+          {
+            echo "id<<__SIM_ID_EOF__"
+            printf '%s' "$simulator_id"
+            echo
+            echo "__SIM_ID_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        working-directory: source
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          if [ -z "$SCHEME_NAME" ]; then
+            echo "SCHEME_NAME secret is required"
+            exit 1
+          fi
+
+          xcodebuild build \
+            -scheme "$SCHEME_NAME" \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -configuration Debug \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee build.log > /dev/null
+
+      - name: Test
+        working-directory: source
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          xcodebuild test \
+            -scheme "$SCHEME_NAME" \
+            -destination "platform=iOS Simulator,id=${{ steps.simulator.outputs.id }}" \
+            -configuration Debug \
+            CODE_SIGN_IDENTITY= \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath TestResults.xcresult \
+            2>&1 | tee test.log > /dev/null
+
+      - name: Sanitize log excerpt
+        if: always()
+        run: |
+          set -euo pipefail
+
+          if [ ! -d source ]; then
+            mkdir -p source
+            printf '%s' 'No log: source was not cloned' > source/sanitized-log.txt
+            exit 0
+          fi
+          cd source
+
+          log_file=""
+          if [ -f test.log ]; then
+            log_file="test.log"
+          elif [ -f build.log ]; then
+            log_file="build.log"
+          fi
+
+          sanitized_log_path="$(pwd)/sanitized-log.txt"
+
+          if [ -z "$log_file" ]; then
+            printf '%s' 'No log file found' > "$sanitized_log_path"
+            exit 0
+          fi
+
+          # Always capture test summary lines (suite/run results, not per-case)
+          test_results="$(grep -E 'Test Suite|Executed|BUILD SUCCEEDED|✘|✔|Test run with|Suite .*passed|Suite .*failed|Test .*failed|Issue recorded' "$log_file" || true)"
+          if [ "${{ job.status }}" != "success" ]; then
+            # On failure, also capture error details
+            error_details="$(grep -E '\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find' "$log_file" || true)"
+            extracted="$(printf '%s\n%s' "$error_details" "$test_results" | awk '!seen[$0]++')"
+          else
+            extracted="$test_results"
+          fi
+
+          if [ -z "$extracted" ]; then
+            extracted='(no matching log lines captured)'
+          fi
+
+          sanitized="$(printf '%s' "$extracted" | sed -E \
+            -e 's#/Users/[^ "\\]*#<path>#g' \
+            -e 's#/private/var/[^ "\\]*#<path>#g' \
+            -e 's#/var/folders/[^ "\\]*#<path>#g' \
+            -e 's#[^ ":]*/source/[^ "\\]*#<path>#g' \
+            -e 's#/Applications/Xcode[^ "\\]*#<xcode>#g' \
+            -e 's#[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}#<uuid>#g' \
+            -e 's#(Apple|iPhone) (Development|Distribution): [^]" )]*#\1 \2: <redacted>#g' \
+            -e 's#signingCertificate *= *[^;) ]*#signingCertificate=<redacted>#g' \
+            -e 's#PROVISIONING_PROFILE[^ =]*=[^ " )]*#PROVISIONING_PROFILE=<redacted>#g' \
+            -e 's#DEVELOPMENT_TEAM *= *[^ " )]*#DEVELOPMENT_TEAM=<redacted>#g')"
+
+          sanitized="$(printf '%s' "$sanitized" | tr '`' "'")"
+          if [ -n "$SCHEME_NAME" ]; then sanitized="${sanitized//$SCHEME_NAME/[SCHEME]}"; fi
+          if [ -n "$BUNDLE_ID" ]; then sanitized="${sanitized//$BUNDLE_ID/<bundle-id>}"; fi
+          if [ -n "$TEAM_ID" ]; then sanitized="${sanitized//$TEAM_ID/<team-id>}"; fi
+          sanitized="$(printf '%s' "$sanitized" | head -60 | head -c 8192 | sed 's/__SANITIZED_EOF__/[REDACTED]/g')"
+
+          printf '%s' "$sanitized" > "$sanitized_log_path"
+
+      - name: Report success status
+        if: success()
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ]; then
+            echo "No project id provided; skipping success status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "⚠️ SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null -w '%{http_code}' -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=success" --data-urlencode "target_url=${run_url}" --data-urlencode "description=Build and tests passed" --data-urlencode "name=ci/proxy" 2>/dev/null)"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "⚠️ Success status update failed with HTTP ${http_code} — continuing anyway"
+            exit 0
+          fi
+
+      - name: Report failure status
+        if: failure()
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ] || [ -z "${SHA:-}" ]; then
+            echo "No project id or sha provided; skipping failure status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "⚠️ SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null -w '%{http_code}' -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=failed" --data-urlencode "target_url=${run_url}" --data-urlencode "description=Build or tests failed" --data-urlencode "name=ci/proxy" 2>/dev/null)"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "⚠️ Failure status update failed with HTTP ${http_code} — continuing anyway"
+            exit 0
+          fi
+
+      - name: Comment on merge request success
+        if: success() && env.MERGE_REQUEST_IID != ''
+        working-directory: source
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "⚠️ SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body_file="$(pwd)/mr-comment-success.md"
+          export RUN_URL="$run_url"
+          export BODY_FILE="$body_file"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          run_url = os.environ["RUN_URL"]
+          body_file = Path(os.environ["BODY_FILE"])
+          log_path = Path.cwd() / "sanitized-log.txt"
+
+          sanitized_excerpt = ""
+          if log_path.exists() and not log_path.is_symlink() and log_path.is_file():
+              sanitized_excerpt = log_path.read_text(encoding="utf-8")
+              sanitized_excerpt = "\n".join(sanitized_excerpt.splitlines()[:60])
+              sanitized_excerpt = sanitized_excerpt.encode("utf-8")[:8192].decode("utf-8", errors="ignore")
+
+          parts = ["✅ Build and tests passed"]
+          if sanitized_excerpt:
+              parts.extend([
+                  "",
+                  "<details><summary>Sanitized test summary</summary>",
+                  "",
+                  "```",
+                  sanitized_excerpt,
+                  "```",
+                  "",
+                  "</details>",
+              ])
+          parts.extend(["", f"[View run]({run_url})"])
+          body_file.write_text("\n".join(parts), encoding="utf-8")
+          PY
+
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/merge_requests/${MERGE_REQUEST_IID}/notes"
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null -w '%{http_code}' -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "body@${body_file}" 2>/dev/null)"
+          rm -f "$body_file"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "⚠️ Success MR comment failed with HTTP ${http_code} — continuing anyway"
+            exit 0
+          fi
+
+      - name: Comment on merge request failure
+        if: failure() && env.MERGE_REQUEST_IID != ''
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "⚠️ SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          body_file="$(pwd)/mr-comment-failure.md"
+          export RUN_URL="$run_url"
+          export BODY_FILE="$body_file"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          run_url = os.environ["RUN_URL"]
+          body_file = Path(os.environ["BODY_FILE"])
+          log_path = Path("source") / "sanitized-log.txt"
+
+          sanitized_excerpt = ""
+          if log_path.exists() and not log_path.is_symlink() and log_path.is_file():
+              sanitized_excerpt = log_path.read_text(encoding="utf-8")
+              sanitized_excerpt = "\n".join(sanitized_excerpt.splitlines()[:60])
+              sanitized_excerpt = sanitized_excerpt.encode("utf-8")[:8192].decode("utf-8", errors="ignore")
+
+          parts = ["❌ Build or tests failed"]
+          if sanitized_excerpt:
+              parts.extend([
+                  "",
+                  "<details><summary>Sanitized error detail</summary>",
+                  "",
+                  "```",
+                  sanitized_excerpt,
+                  "```",
+                  "",
+                  "</details>",
+              ])
+          parts.extend(["", f"[View run]({run_url})"])
+          body_file.write_text("\n".join(parts), encoding="utf-8")
+          PY
+
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/merge_requests/${MERGE_REQUEST_IID}/notes"
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -o /dev/null -w '%{http_code}' -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "body@${body_file}" 2>/dev/null)"
+          rm -f "$body_file"
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "⚠️ Failure MR comment failed with HTTP ${http_code} — continuing anyway"
+            exit 0
+          fi
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -rf source

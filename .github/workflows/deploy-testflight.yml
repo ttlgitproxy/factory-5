@@ -1,0 +1,941 @@
+name: Deploy to TestFlight
+
+on:
+  repository_dispatch:
+    types: [deploy-testflight]
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Dispatch state job ID (UUID from dispatch-state repo)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: testflight-deploy-execution
+  cancel-in-progress: false
+
+jobs:
+  deploy-testflight:
+    runs-on: macos-latest
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      SCHEME_NAME: ${{ secrets.SCHEME_NAME }}
+      BUNDLE_ID: ${{ secrets.BUNDLE_ID }}
+      TEAM_ID: ${{ secrets.TEAM_ID }}
+
+    steps:
+      - name: Parse dispatch payload
+        env:
+          PROXY_PAT: ${{ secrets.PROXY_PAT }}
+          WORKFLOW_JOB_ID: ${{ github.event.inputs.job_id }}
+        run: |
+          set -euo pipefail
+
+          # Extract fallback fields from payload for status reporting if state fetch fails
+          fallback_project_id="$(jq -r '.client_payload.project_id // empty' "$GITHUB_EVENT_PATH")"
+          fallback_sha="$(jq -r '.client_payload.sha // empty' "$GITHUB_EVENT_PATH")"
+          set_fallback_env() {
+            if [ -n "$fallback_project_id" ] && printf '%s' "$fallback_project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+              echo "::add-mask::$fallback_project_id"
+              echo "PROJECT_ID=$fallback_project_id" >> "$GITHUB_ENV"
+            fi
+            if [ -n "$fallback_sha" ] && printf '%s' "$fallback_sha" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::add-mask::$fallback_sha"
+              echo "SHA=$fallback_sha" >> "$GITHUB_ENV"
+            fi
+          }
+
+          job_id="$(jq -r '.client_payload.job_id // empty' "$GITHUB_EVENT_PATH")"
+          if [ -z "$job_id" ]; then
+            job_id="$WORKFLOW_JOB_ID"
+          fi
+
+          if [ -z "$job_id" ]; then
+            echo "Missing job_id in dispatch payload"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$job_id" | LC_ALL=C grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "Invalid job_id format"
+            set_fallback_env
+            exit 1
+          fi
+
+          state_url="https://api.github.com/repos/ttlgitproxy/dispatch-state/contents/${job_id}.json"
+
+          state_response="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS \
+            -H "Authorization: token ${PROXY_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$state_url")"
+
+          file_sha="$(printf '%s' "$state_response" | jq -r '.sha // empty')"
+          encoded_content="$(printf '%s' "$state_response" | jq -r '.content // empty')"
+
+          if [ -z "$file_sha" ] || [ -z "$encoded_content" ]; then
+            echo "Failed to fetch dispatch state for job ${job_id}"
+            set_fallback_env
+            exit 1
+          fi
+
+          echo "::add-mask::$file_sha"
+
+          state_json="$(printf '%s' "$encoded_content" | tr -d '\n' | /usr/bin/base64 -D)"
+
+          ref="$(printf '%s' "$state_json" | jq -r '.ref // empty')"
+          sha="$(printf '%s' "$state_json" | jq -r '.sha // empty')"
+          project_id="$(printf '%s' "$state_json" | jq -r '.project_id // empty')"
+
+          event_type="$(printf '%s' "$state_json" | jq -r '.event_type // empty')"
+          if [ "$event_type" != "deploy-testflight" ]; then
+            echo "State file event_type mismatch (expected deploy-testflight)"
+            set_fallback_env
+            exit 1
+          fi
+
+          delete_payload="$(jq -n \
+            --arg message "consumed dispatch state for job ${job_id}" \
+            --arg file_sha "$file_sha" \
+            '{message: $message, sha: $file_sha}')"
+
+          delete_response="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -w '\n%{http_code}' \
+            -X DELETE \
+            -H "Authorization: token ${PROXY_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "$state_url" \
+            -d "$delete_payload")"
+
+          delete_http_code="$(printf '%s' "$delete_response" | tail -1)"
+          if [ "$delete_http_code" -lt 200 ] || [ "$delete_http_code" -ge 300 ]; then
+            echo "Γ¥î Failed to delete dispatch state ΓÇö aborting to prevent replay"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -z "$ref" ] || [ -z "$sha" ]; then
+            echo "Missing ref or sha in dispatch state"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$ref" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
+            echo "Invalid ref format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if ! printf '%s' "$sha" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Invalid sha format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -n "$project_id" ] && ! printf '%s' "$project_id" | LC_ALL=C grep -Eq '^[0-9]+$'; then
+            echo "Invalid project_id format"
+            set_fallback_env
+            exit 1
+          fi
+
+          if [ -n "$ref" ]; then echo "::add-mask::$ref"; fi
+          if [ -n "$sha" ]; then echo "::add-mask::$sha"; fi
+          if [ -n "$project_id" ]; then echo "::add-mask::$project_id"; fi
+
+          {
+            echo "REF<<__REF_EOF__"
+            printf '%s' "$ref"
+            echo
+            echo "__REF_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "SHA<<__SHA_EOF__"
+            printf '%s' "$sha"
+            echo
+            echo "__SHA_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "PROJECT_ID<<__PROJECT_ID_EOF__"
+            printf '%s' "$project_id"
+            echo
+            echo "__PROJECT_ID_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout CI configuration
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            .github/sanitize-patterns.json
+            .github/scripts/observe_signing_input_provenance.py
+          sparse-checkout-cone-mode: false
+
+      - name: Clone source repository
+        env:
+          SOURCE_REPOSITORY_URL: ${{ secrets.SOURCE_REPOSITORY_URL }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SOURCE_REPOSITORY_URL" ]; then
+            echo "SOURCE_REPOSITORY_URL secret is required"
+            exit 1
+          fi
+
+          echo "::add-mask::$SOURCE_REPOSITORY_URL"
+
+          git clone --depth 1 --branch "$REF" "$SOURCE_REPOSITORY_URL" source 2>/dev/null || {
+            git clone "$SOURCE_REPOSITORY_URL" source 2>/dev/null
+            cd source
+            git checkout --detach "$SHA" > /dev/null 2>&1
+          }
+
+      - name: Summarize SCM callback target
+        run: |
+          set -euo pipefail
+          if [ -z "${PROJECT_ID:-}" ] || [ -z "${SHA:-}" ] || [ -z "${REF:-}" ]; then
+            echo "SCM callback target incomplete; project_id_present=$([ -n "${PROJECT_ID:-}" ] && echo yes || echo no) sha_present=$([ -n "${SHA:-}" ] && echo yes || echo no) ref_present=$([ -n "${REF:-}" ] && echo yes || echo no)"
+            exit 0
+          fi
+
+          echo "::add-mask::${PROJECT_ID}"
+          echo "::add-mask::${SHA:0:12}"
+          echo "::add-mask::${REF}"
+          echo "SCM callback target ready"
+
+      - name: Report pending status
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ] || [ -z "${SHA:-}" ]; then
+            echo "No project id or sha provided; skipping pending status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "ΓÜá∩╕Å SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          echo "Posting pending status update"
+          set +e
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=running" --data-urlencode "target_url=${run_url}" --data-urlencode "description=Deploy in progress" --data-urlencode "name=deploy/proxy" -o /dev/null -w '%{http_code}' 2>&1)"
+          curl_exit=$?
+          set -e
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "ΓÜá∩╕Å Pending status update curl failed (exit ${curl_exit}) ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          if ! printf '%s' "$http_code" | LC_ALL=C grep -Eq '^[0-9]{3}$'; then
+            echo "Pending status update returned an invalid HTTP code; continuing anyway"
+            exit 0
+          fi
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "ΓÜá∩╕Å Pending status update failed with HTTP ${http_code} ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          echo "Pending status update accepted (HTTP ${http_code})"
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+
+          preferred="$(find /Applications -maxdepth 1 -type d -name 'Xcode_26*.app' | LC_ALL=C sort | tail -1)"
+          fallback="$(find /Applications -maxdepth 1 -type d -name 'Xcode*.app' | LC_ALL=C sort | tail -1)"
+          xcode_path="${preferred:-$fallback}"
+          if [ -z "$xcode_path" ]; then
+            echo "No Xcode installation found"
+            exit 1
+          fi
+
+          sudo xcode-select -s "$xcode_path/Contents/Developer"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: source
+        run: |
+          set -euo pipefail
+          xcodegen generate > /dev/null 2>&1
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+          bundler-cache: true
+          working-directory: source
+
+      - name: Install bundle dependencies
+        working-directory: source
+        run: |
+          set -euo pipefail
+          bundle install --quiet > /dev/null 2>&1
+
+      - name: Import signing certificate
+        env:
+          SIGNING_CERTIFICATE_BASE64: ${{ secrets.SIGNING_CERTIFICATE_BASE64 }}
+          SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$SIGNING_CERTIFICATE_BASE64" ] || [ -z "$SIGNING_CERTIFICATE_PASSWORD" ]; then
+            echo "Signing certificate secrets are required"
+            exit 1
+          fi
+
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          keychain_password="$(openssl rand -base64 32)"
+          certificate_path="$RUNNER_TEMP/signing-certificate.p12"
+
+          echo "::add-mask::$keychain_password"
+          echo "::add-mask::$keychain_path"
+          echo "::add-mask::$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path" > /dev/null 2>&1
+          security set-keychain-settings -lut 21600 "$keychain_path" > /dev/null 2>&1
+          security unlock-keychain -p "$keychain_password" "$keychain_path" > /dev/null 2>&1
+          printf '%s' "$SIGNING_CERTIFICATE_BASE64" | /usr/bin/base64 -D > "$certificate_path"
+          security import "$certificate_path" -P "$SIGNING_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path" > /dev/null 2>&1
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain_path" > /dev/null 2>&1
+          security list-keychains -d user -s "$keychain_path" > /dev/null 2>&1
+
+          {
+            echo "KEYCHAIN_PATH<<__KEYCHAIN_PATH_EOF__"
+            printf '%s' "$keychain_path"
+            echo
+            echo "__KEYCHAIN_PATH_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "CERTIFICATE_PATH<<__CERTIFICATE_PATH_EOF__"
+            printf '%s' "$certificate_path"
+            echo
+            echo "__CERTIFICATE_PATH_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Import provisioning profile
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROVISIONING_PROFILE_BASE64" ] || [ -z "$BUNDLE_ID" ] || [ -z "$TEAM_ID" ]; then
+            echo "PROVISIONING_PROFILE_BASE64, BUNDLE_ID, and TEAM_ID secrets are required"
+            exit 1
+          fi
+
+          profile_path="$RUNNER_TEMP/profile.mobileprovision"
+          echo "::add-mask::$profile_path"
+          printf '%s' "$PROVISIONING_PROFILE_BASE64" | /usr/bin/base64 -D > "$profile_path"
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+
+          profile_plist="$(security cms -D -i "$profile_path" 2>/dev/null)"
+          profile_uuid="$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$profile_plist")"
+          profile_name="$(/usr/libexec/PlistBuddy -c 'Print Name' /dev/stdin <<< "$profile_plist")"
+          profile_team_id="$(/usr/libexec/PlistBuddy -c 'Print TeamIdentifier:0' /dev/stdin <<< "$profile_plist")"
+          profile_app_id="$(/usr/libexec/PlistBuddy -c 'Print Entitlements:application-identifier' /dev/stdin <<< "$profile_plist")"
+          expiration_date="$(/usr/libexec/PlistBuddy -c 'Print ExpirationDate' /dev/stdin <<< "$profile_plist")"
+
+          if [ -z "$profile_uuid" ] || ! printf '%s' "$profile_uuid" | LC_ALL=C grep -Eq '^[0-9A-Fa-f-]{36}$'; then
+            echo "Invalid provisioning profile UUID"
+            exit 1
+          fi
+
+          if [ -z "$profile_name" ] || printf '%s' "$profile_name" | LC_ALL=C grep -q '[^[:print:]]'; then
+            echo "Invalid provisioning profile name"
+            exit 1
+          fi
+
+          if [ "$profile_team_id" != "$TEAM_ID" ]; then
+            echo "Provisioning profile team identifier does not match TEAM_ID secret"
+            exit 1
+          fi
+
+          expected_app_id="${TEAM_ID}.${BUNDLE_ID}"
+          if [ "$profile_app_id" != "$expected_app_id" ]; then
+            echo "Provisioning profile app identifier does not match BUNDLE_ID secret"
+            exit 1
+          fi
+
+          if ! /usr/bin/python3 - "$expiration_date" <<'PY'
+          import datetime
+          import sys
+          raw = sys.argv[1]
+          value = datetime.datetime.strptime(raw, '%a %b %d %H:%M:%S %Z %Y')
+          if value <= datetime.datetime.utcnow():
+              raise SystemExit(1)
+          PY
+          then
+            echo "Provisioning profile is expired"
+            exit 1
+          fi
+
+          cp "$profile_path" "$HOME/Library/MobileDevice/Provisioning Profiles/${profile_uuid}.mobileprovision"
+          echo "::add-mask::$profile_uuid"
+          echo "::add-mask::$profile_name"
+          echo "::add-mask::$profile_app_id"
+          echo "::add-mask::$expiration_date"
+
+          {
+            echo "PROFILE_PATH<<__PROFILE_PATH_EOF__"
+            printf '%s' "$profile_path"
+            echo
+            echo "__PROFILE_PATH_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "PROFILE_UUID<<__PROFILE_UUID_EOF__"
+            printf '%s' "$profile_uuid"
+            echo
+            echo "__PROFILE_UUID_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "PROFILE_NAME<<__PROFILE_NAME_EOF__"
+            printf '%s' "$profile_name"
+            echo
+            echo "__PROFILE_NAME_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Observe signing input file provenance (temporary)
+        env:
+          DIAGNOSTIC_EXPECTED_P12_SHA256: ${{ secrets.DIAGNOSTIC_EXPECTED_P12_SHA256 }}
+          DIAGNOSTIC_EXPECTED_PROFILE_SHA256: ${{ secrets.DIAGNOSTIC_EXPECTED_PROFILE_SHA256 }}
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 .github/scripts/observe_signing_input_provenance.py
+
+      - name: Validate signing identity against provisioning profile
+        run: |
+          set -euo pipefail
+
+          identity_output="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" 2>/dev/null || true)"
+          identity_hashes="$(printf '%s\n' "$identity_output" | sed -nE 's/^[[:space:]]*[0-9]+\) ([0-9A-Fa-f]{40}) .*/\1/p')"
+          valid_identity_count="$(printf '%s\n' "$identity_hashes" | awk 'NF { count++ } END { print count + 0 }')"
+          echo "VALID_IDENTITY_COUNT=${valid_identity_count}"
+
+          if [ "$valid_identity_count" -ne 1 ]; then
+            echo "P12_PROFILE_MATCH=no"
+            exit 1
+          fi
+
+          identity_hash="$(printf '%s\n' "$identity_hashes" | head -1)"
+          profile_plist="$RUNNER_TEMP/signing-profile.plist"
+          cleanup_validation_files() {
+            rm -f "$profile_plist"
+          }
+          trap cleanup_validation_files EXIT
+
+          validation_status='profile_decode_error'
+          if security cms -D -i "$PROFILE_PATH" > "$profile_plist" 2>/dev/null; then
+            validation_status="$(/usr/bin/python3 - "$identity_hash" "$profile_plist" 2>/dev/null <<'PY'
+          import hashlib
+          import pathlib
+          import plistlib
+          import sys
+
+          identity_hash = sys.argv[1].lower()
+          try:
+              profile = plistlib.loads(pathlib.Path(sys.argv[2]).read_bytes())
+          except (OSError, plistlib.InvalidFileException):
+              print("profile_parse_error")
+              raise SystemExit(0)
+
+          if not isinstance(profile, dict):
+              print("profile_parse_error")
+              raise SystemExit(0)
+
+          developer_certificates = profile.get("DeveloperCertificates")
+          if not isinstance(developer_certificates, list):
+              print("developer_certificates_missing")
+              raise SystemExit(0)
+
+          profile_identity_hashes = [
+              hashlib.sha1(certificate).hexdigest()
+              for certificate in developer_certificates
+              if isinstance(certificate, bytes)
+          ]
+          print("match" if identity_hash in profile_identity_hashes else "mismatch")
+          PY
+            )" || validation_status='validation_error'
+          fi
+
+          echo "SIGNING_VALIDATION_STATUS=${validation_status}"
+          match_result='no'
+          if [ "$validation_status" = 'match' ]; then
+            match_result='yes'
+          fi
+          echo "P12_PROFILE_MATCH=${match_result}"
+          [ "$match_result" = 'yes' ]
+
+      - name: Generate export options plist
+        run: |
+          set -euo pipefail
+
+          export_options_plist="$RUNNER_TEMP/ExportOptions.plist"
+          /usr/bin/plutil -create xml1 "$export_options_plist"
+          /usr/libexec/PlistBuddy -c 'Add :method string app-store' "$export_options_plist"
+          /usr/libexec/PlistBuddy -c "Add :teamID string ${TEAM_ID}" "$export_options_plist"
+          /usr/libexec/PlistBuddy -c 'Add :signingStyle string manual' "$export_options_plist"
+          /usr/libexec/PlistBuddy -c 'Add :signingCertificate string Apple Distribution' "$export_options_plist"
+          /usr/libexec/PlistBuddy -c 'Add :provisioningProfiles dict' "$export_options_plist"
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:${BUNDLE_ID} string ${PROFILE_UUID}" "$export_options_plist"
+
+          {
+            echo "EXPORT_OPTIONS_PLIST<<__EXPORT_OPTIONS_PLIST_EOF__"
+            printf '%s' "$export_options_plist"
+            echo
+            echo "__EXPORT_OPTIONS_PLIST_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Create App Store Connect API key
+        env:
+          ASC_KEY_BASE64: ${{ secrets.ASC_KEY_BASE64 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        working-directory: source
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ASC_KEY_BASE64" ] || [ -z "$ASC_KEY_ID" ] || [ -z "$ASC_ISSUER_ID" ]; then
+            echo "App Store Connect secrets are required"
+            exit 1
+          fi
+
+          key_dir='fastlane/keys'
+          key_path="${key_dir}/AuthKey_${ASC_KEY_ID}.p8"
+          mkdir -p "$key_dir"
+          echo "::add-mask::$ASC_KEY_ID"
+          echo "::add-mask::$ASC_ISSUER_ID"
+          printf '%s' "$ASC_KEY_BASE64" | /usr/bin/base64 -D > "$key_path"
+
+          {
+            echo "ASC_KEY_PATH<<__ASC_KEY_PATH_EOF__"
+            printf '%s' "$key_path"
+            echo
+            echo "__ASC_KEY_PATH_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Build and upload with Fastlane
+        working-directory: source
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          set -o pipefail
+
+          if [ -z "$SCHEME_NAME" ]; then
+            echo "SCHEME_NAME secret is required"
+            exit 1
+          fi
+
+          export APP_IDENTIFIER="$BUNDLE_ID"
+          export GYM_SCHEME="$SCHEME_NAME"
+          export GYM_EXPORT_OPTIONS="$EXPORT_OPTIONS_PLIST"
+          printf -v keychain_code_sign_flags '%q' "--keychain ${KEYCHAIN_PATH}"
+          export GYM_XCARGS="PROVISIONING_PROFILE_SPECIFIER='${PROFILE_UUID}' CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY='Apple Distribution' DEVELOPMENT_TEAM='${TEAM_ID}' PRODUCT_BUNDLE_IDENTIFIER='${BUNDLE_ID}' OTHER_CODE_SIGN_FLAGS=${keychain_code_sign_flags}"
+
+          set +e
+          bundle exec fastlane beta > deploy.log 2>&1
+          fastlane_exit="$?"
+          set -e
+
+          if [ "$fastlane_exit" -ne 0 ]; then
+            echo "::warning::Fastlane beta exited with code $fastlane_exit; log withheld for privacy"
+            if [ -f deploy.log ]; then
+              line_count="$(wc -l < deploy.log)"
+              echo "deploy.log: ${line_count} lines captured"
+            fi
+            exit "$fastlane_exit"
+          else
+            echo "Fastlane beta succeeded"
+          fi
+
+      - name: Sanitize deploy log for private status reporting
+        id: sanitize_deploy_log
+        if: always() && hashFiles('source/deploy.log') != ''
+        working-directory: source
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          temp_log="deploy-sanitizing.tmp"
+          final_log="deploy-sanitized.log"
+          cleanup() {
+            rm -f "$temp_log" "$temp_log.bak"
+          }
+          trap cleanup EXIT
+          rm -f "$temp_log" "$temp_log.bak" "$final_log"
+          if [ ! -f deploy.log ]; then
+            echo "No deploy.log to sanitize"
+            exit 0
+          fi
+          config_path="$GITHUB_WORKSPACE/.github/sanitize-patterns.json"
+          if [ ! -f "$config_path" ]; then
+            echo "No sanitizer config; withholding private log details" >&2
+            exit 1
+          fi
+          # Remove terminal formatting before matching diagnostics or sensitive values.
+          sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' deploy.log > "$temp_log"
+          # @tsv doubles regex backslashes; join preserves the JSON-decoded expressions.
+          static_patterns="$(jq -r '.static_patterns[] | [.match, .replace] | join("\t")' "$config_path")" || {
+            echo "Failed to parse static_patterns from sanitizer config" >&2
+            exit 1
+          }
+          dynamic_env_vars="$(jq -r '.dynamic_env_vars[]?' "$config_path")" || {
+            echo "Failed to parse dynamic_env_vars from sanitizer config" >&2
+            exit 1
+          }
+          while IFS=$'\t' read -r match replace; do
+            if [ -z "${match:-}" ]; then
+              continue
+            fi
+            match="${match//#/\\#}"
+            replace="${replace//#/\\#}"
+            sed -i.bak -E "s#${match}#${replace}#g" "$temp_log"
+          done <<< "$static_patterns"
+          while IFS= read -r var_name; do
+            if [ -z "${var_name:-}" ]; then
+              continue
+            fi
+            val="${!var_name:-}"
+            if [ -z "$val" ]; then
+              continue
+            fi
+            slug="$(printf '%s' "$var_name" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
+            while IFS= read -r line || [ -n "$line" ]; do
+              printf '%s\n' "${line//"$val"/<${slug}>}"
+            done < "$temp_log" > "$temp_log.bak"
+            mv "$temp_log.bak" "$temp_log"
+          done <<< "$dynamic_env_vars"
+          rm -f "$temp_log.bak"
+          mv "$temp_log" "$final_log"
+          trap - EXIT
+
+      - name: Prepare sanitized deploy log excerpt
+        if: always() && steps.sanitize_deploy_log.outcome == 'success' && hashFiles('source/deploy-sanitized.log') != ''
+        working-directory: source
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          config_path="$GITHUB_WORKSPACE/.github/sanitize-patterns.json"
+          if [ ! -f "$config_path" ]; then
+            echo "Missing sanitizer config: $config_path" >&2
+            exit 1
+          fi
+          backtick_to_quote="$(jq -r '.post_processing.backtick_to_quote // true' "$config_path")"
+          max_lines="$(jq -r '.post_processing.max_lines // 60' "$config_path")"
+          max_bytes="$(jq -r '.post_processing.max_bytes // 4096' "$config_path")"
+          eof_guard_enabled="$(jq -r '.post_processing.eof_guard // true' "$config_path")"
+          eof_guard="__SANITIZED_EOF__"
+
+          apply_post_processing() {
+            local input="$1"
+            local output="$input"
+            if [ "$backtick_to_quote" = 'true' ]; then
+              output="$(printf '%s' "$output" | tr '`' "'")"
+            fi
+            if [ "$eof_guard_enabled" = 'true' ]; then
+              output="${output//$eof_guard/[REDACTED]}"
+            fi
+            printf '%s' "$output"
+          }
+
+          extracted="$(cat deploy-sanitized.log)"
+          if [ -z "$extracted" ]; then
+            extracted='The deploy script produced an empty log.'
+          fi
+
+          # Reserve the diagnostic and truncation notice before fitting optional context.
+          # Applying a prefix byte cutoff afterward could discard the error itself.
+          sanitized="$(apply_post_processing "$extracted" | jq -Rrs \
+            --argjson max_lines "$max_lines" --argjson max_bytes "$max_bytes" '
+            def clip($limit):
+              .[0:$limit] | until(utf8bytelength <= $limit; .[0:-1]);
+            "--- [truncated; full log withheld for privacy] ---" as $notice
+            | split("\n") as $lines
+            | if ($lines | length) <= $max_lines and utf8bytelength <= $max_bytes then .
+              elif $max_lines < 2 or $max_bytes <= ($notice | utf8bytelength) + 1 then
+                error("Excerpt limits must accommodate a diagnostic and truncation notice")
+              else
+                ([range(0; $lines | length)
+                  | select($lines[.] | test("(^|[[:space:]])(fatal )?error:|clang: .*error:|ld: .*"; "i"))][0]
+                 // [range(0; $lines | length)
+                     | select($lines[.] | test("error[: ]|failed|fatal|could not|cannot|loaderror|nomethoderror|nameerror|syntaxerror"; "i"))][0]
+                 // (($lines | length) - 1)) as $focus
+                | ($lines[$focus] | clip($max_bytes - ($notice | utf8bytelength) - 1)) as $diagnostic
+                | (([range([0, ($lines | length) - 30] | max; $lines | length)] | reverse)
+                   + [range([0, $focus - 3] | max; [$lines | length, $focus + 26] | min)]) as $candidates
+                | reduce $candidates[] as $index (
+                    {entries: [{index: $focus, text: $diagnostic}],
+                     bytes: (($diagnostic | utf8bytelength) + ($notice | utf8bytelength) + 1)};
+                    if all(.entries[]; .index != $index)
+                       and (.entries | length) < $max_lines - 1
+                       and .bytes + ($lines[$index] | utf8bytelength) + 1 <= $max_bytes then
+                      .entries += [{index: $index, text: $lines[$index]}]
+                      | .bytes += ($lines[$index] | utf8bytelength) + 1
+                    else . end)
+                | ([.entries | sort_by(.index)[] | .text] + [$notice] | join("\n"))
+              end
+          ')"
+
+          # Mask private-source text before later step headers display the environment.
+          masked_detail="${sanitized//'%'/'%25'}"
+          masked_detail="${masked_detail//$'\r'/'%0D'}"
+          masked_detail="${masked_detail//$'\n'/'%0A'}"
+          echo "::add-mask::$masked_detail"
+
+          {
+            echo "DEPLOY_ERROR_DETAIL<<${eof_guard}"
+            printf '%s' "$sanitized"
+            echo
+            echo "${eof_guard}"
+          } >> "$GITHUB_ENV"
+
+      - name: Extract deploy metadata
+        if: always()
+        working-directory: source
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          output_eof_guard="__DEPLOY_ERROR_EOF__"
+
+          build_number='unknown'
+          version='unknown'
+
+          if [ -f deploy.log ]; then
+            build_number="$(grep -iE 'Incrementing build number to [0-9]+|build_number.*[0-9]+|CFBundleVersion.*[0-9]+' deploy.log | grep -oE '[0-9]+' | tail -1 || true)"
+            version="$(grep -iE 'CFBundleShortVersionString|ShortVersionString|MARKETING_VERSION|[0-9]+\.[0-9]+(\.[0-9]+)?' deploy.log | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)"
+          fi
+
+          if [ -z "$build_number" ]; then build_number='unknown'; fi
+          if [ -z "$version" ]; then version='unknown'; fi
+
+          deploy_error=''
+          if [ -f deploy-sanitized.log ]; then
+            deploy_error="$(grep -iE '((^|[[:space:]])(fatal )?error:|clang: .*error:|ld: .*)' deploy-sanitized.log | head -1 || true)"
+            if [ -z "$deploy_error" ]; then
+              deploy_error="$(grep -E '\*\* (BUILD|ARCHIVE) FAILED \*\*' deploy-sanitized.log | head -1 || true)"
+            fi
+            if [ -z "$deploy_error" ]; then
+              deploy_error="$(grep -E '^\[!\]' deploy-sanitized.log || true)"
+            fi
+            if [ -z "$deploy_error" ]; then
+              deploy_error="$(grep -iE 'LoadError|NoMethodError|NameError|SyntaxError|cannot load|undefined method' deploy-sanitized.log | grep -v '^\s*$' | head -1 || true)"
+            fi
+            if [ -z "$deploy_error" ]; then
+              deploy_error="$(grep -iE 'error|fatal|failed|Could not|cannot|No available|Unauthorized|forbidden|timed out|refused|Invalid|not found|Connection|App Store Connect|authentication' deploy-sanitized.log | grep -v '^\s*$' | tail -1 || true)"
+            fi
+            if [ -z "$deploy_error" ]; then
+              deploy_error="$(head -3 deploy-sanitized.log | tail -1 || true)"
+            fi
+
+            deploy_error="$(printf '%s' "$deploy_error" | tr '\n`' " '" | sed -E 's/[[:space:]]+/ /g' | cut -c1-200)"
+          elif [ -n "${DEPLOY_ERROR_DETAIL:-}" ]; then
+            deploy_error="$DEPLOY_ERROR_DETAIL"
+            deploy_error="$(printf '%s' "$deploy_error" | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g' | cut -c1-200)"
+          fi
+
+          deploy_error="${deploy_error//$output_eof_guard/[REDACTED]}"
+          if [ -n "$deploy_error" ]; then
+            masked_error="${deploy_error//'%'/'%25'}"
+            masked_error="${masked_error//$'\r'/'%0D'}"
+            masked_error="${masked_error//$'\n'/'%0A'}"
+            echo "::add-mask::$masked_error"
+          fi
+
+          {
+            echo "BUILD_NUMBER<<__BUILD_NUMBER_EOF__"
+            printf '%s' "$build_number"
+            echo
+            echo "__BUILD_NUMBER_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "VERSION<<__VERSION_EOF__"
+            printf '%s' "$version"
+            echo
+            echo "__VERSION_EOF__"
+          } >> "$GITHUB_ENV"
+          {
+            echo "DEPLOY_ERROR<<__DEPLOY_ERROR_EOF__"
+            printf '%s' "$deploy_error"
+            echo
+            echo "__DEPLOY_ERROR_EOF__"
+          } >> "$GITHUB_ENV"
+
+      - name: Report success status
+        if: success()
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ] || [ -z "${SHA:-}" ]; then
+            echo "No project id or sha provided; skipping success status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "ΓÜá∩╕Å SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          description="Deploy succeeded ΓÇö v${VERSION} (${BUILD_NUMBER})"
+          echo "Posting success status update"
+          set +e
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=success" --data-urlencode "target_url=${run_url}" --data-urlencode "description=${description}" --data-urlencode "name=deploy/proxy" -o /dev/null -w '%{http_code}' 2>&1)"
+          curl_exit=$?
+          set -e
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "ΓÜá∩╕Å Success status update curl failed (exit ${curl_exit}) ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          if ! printf '%s' "$http_code" | LC_ALL=C grep -Eq '^[0-9]{3}$'; then
+            echo "Success status update returned an invalid HTTP code; continuing anyway"
+            exit 0
+          fi
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "ΓÜá∩╕Å Success status update failed with HTTP ${http_code} ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          echo "Success status update accepted (HTTP ${http_code})"
+
+      - name: Report failure status
+        if: failure()
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$PROJECT_ID" ] || [ -z "${SHA:-}" ]; then
+            echo "No project id or sha provided; skipping failure status update"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "ΓÜá∩╕Å SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/statuses/${SHA}"
+          description="Deploy failed"
+          if [ -n "${DEPLOY_ERROR:-}" ]; then
+            description="Deploy failed ΓÇö ${DEPLOY_ERROR:0:80}"
+          fi
+          echo "Posting failure status update"
+          set +e
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "state=failed" --data-urlencode "target_url=${run_url}" --data-urlencode "description=${description}" --data-urlencode "name=deploy/proxy" -o /dev/null -w '%{http_code}' 2>&1)"
+          curl_exit=$?
+          set -e
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "ΓÜá∩╕Å Failure status update curl failed (exit ${curl_exit}) ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          if ! printf '%s' "$http_code" | LC_ALL=C grep -Eq '^[0-9]{3}$'; then
+            echo "Failure status update returned an invalid HTTP code; continuing anyway"
+            exit 0
+          fi
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "ΓÜá∩╕Å Failure status update failed with HTTP ${http_code} ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          echo "Failure status update accepted (HTTP ${http_code})"
+
+      - name: Comment on source commit
+        if: always()
+        env:
+          SCM_API_BASE_URL: ${{ secrets.SCM_API_BASE_URL }}
+          SCM_API_TOKEN: ${{ secrets.SCM_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PROJECT_ID:-}" ] || [ -z "${SHA:-}" ]; then
+            echo "No project id or sha provided; skipping commit comment"
+            exit 0
+          fi
+
+          if [ -z "$SCM_API_BASE_URL" ] || [ -z "$SCM_API_TOKEN" ]; then
+            echo "ΓÜá∩╕Å SCM_API_BASE_URL or SCM_API_TOKEN not configured; skipping status reporting"
+            exit 0
+          fi
+
+          run_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ "${{ job.status }}" = 'success' ]; then
+            body="Deploy succeeded - v${VERSION:-unknown} (${BUILD_NUMBER:-unknown})"
+          else
+            body="$(printf 'Deploy to TestFlight failed\n\nError: %s' "${DEPLOY_ERROR:-No error details captured}")"
+          fi
+          body="$(printf '%s\n\n[View run](%s)\n\n<details><summary>Sanitized deploy log excerpt</summary>\n\n```text\n%s\n```\n\n</details>' \
+            "$body" "$run_url" "${DEPLOY_ERROR_DETAIL:-Sanitized deploy log unavailable; the deploy script may not have run or log sanitization failed.}")"
+
+          endpoint="${SCM_API_BASE_URL%/}/projects/${PROJECT_ID}/repository/commits/${SHA}/comments"
+          echo "Posting commit comment"
+          set +e
+          http_code="$(curl --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -sS -X POST -H "PRIVATE-TOKEN: ${SCM_API_TOKEN}" "$endpoint" --data-urlencode "note=${body}" -o /dev/null -w '%{http_code}' 2>&1)"
+          curl_exit=$?
+          set -e
+
+          if [ "$curl_exit" -ne 0 ]; then
+            echo "ΓÜá∩╕Å Commit comment curl failed (exit ${curl_exit}) ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          if ! printf '%s' "$http_code" | LC_ALL=C grep -Eq '^[0-9]{3}$'; then
+            echo "Commit comment returned an invalid HTTP code; continuing anyway"
+            exit 0
+          fi
+
+          if [ "$http_code" -lt 200 ] || [ "$http_code" -ge 300 ]; then
+            echo "ΓÜá∩╕Å Commit comment failed with HTTP ${http_code} ΓÇö continuing anyway"
+            exit 0
+          fi
+
+          echo "Commit comment accepted (HTTP ${http_code})"
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f "${ASC_KEY_PATH:-}"
+          rm -f "${CERTIFICATE_PATH:-}"
+          rm -f "${PROFILE_PATH:-}"
+          rm -f "${EXPORT_OPTIONS_PLIST:-}"
+          if [ -n "${PROFILE_UUID:-}" ]; then
+            rm -f "$HOME/Library/MobileDevice/Provisioning Profiles/${PROFILE_UUID}.mobileprovision"
+          fi
+          if [ -n "${KEYCHAIN_PATH:-}" ]; then
+            security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          fi
+          rm -rf source
