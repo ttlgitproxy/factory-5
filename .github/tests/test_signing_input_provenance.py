@@ -238,6 +238,126 @@ class SigningInputProvenanceTests(unittest.TestCase):
         self.assert_comparison(self.run_observer(), "yes", "yes")
 
 
+class DeployLogSanitizerTests(unittest.TestCase):
+    STEP_NAME = "Sanitize deploy log for private status reporting"
+
+    def sanitizer_script(self):
+        workflow = (ROOT / ".github" / "workflows" / "deploy-testflight.yml").read_text(
+            encoding="utf-8"
+        )
+        steps = workflow.split("      - name: ")[1:]
+        names = [step.splitlines()[0] for step in steps]
+        step = steps[names.index(self.STEP_NAME)]
+        _, separator, body = step.partition("        run: |\n")
+        self.assertEqual(separator, "        run: |\n")
+        lines = body.splitlines()
+        for line in lines:
+            if line:
+                self.assertTrue(line.startswith(" " * 10), line)
+        return "".join(line[10:] + "\n" for line in lines)
+
+    def test_sanitizer_sed_calls_use_c_locale(self):
+        # macOS sed rejects the ANSI byte ranges under UTF-8 collation.
+        script = self.sanitizer_script()
+        sed_calls = [
+            line.strip()
+            for line in script.splitlines()
+            if "sed" in line.split() and not line.strip().startswith("#")
+        ]
+        self.assertIn(
+            "LC_ALL=C sed -E $'s/\\033\\\\[[0-?]*[ -/]*[@-~]//g' deploy.log > \"$temp_log\"",
+            sed_calls,
+        )
+        self.assertIn(
+            'LC_ALL=C sed -i.bak -E "s#${match}#${replace}#g" "$temp_log"',
+            sed_calls,
+        )
+        for call in sed_calls:
+            self.assertTrue(call.startswith("LC_ALL=C sed "), call)
+
+    def test_sanitizer_strips_ansi_and_redacts_under_utf8_locale(self):
+        if os.name == "nt":
+            self.skipTest("workflow shell steps target macOS bash")
+        try:
+            probe = subprocess.run(
+                ["bash", "-c", "command -v sed >/dev/null && command -v jq >/dev/null"],
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            self.skipTest("bash is not available")
+        if probe.returncode != 0:
+            self.skipTest("sed or jq is not available")
+
+        temporary = tempfile.TemporaryDirectory(prefix="synthetic-sanitizer-")
+        self.addCleanup(temporary.cleanup)
+        workspace = Path(temporary.name)
+        (workspace / ".github").mkdir()
+        (workspace / ".github" / "sanitize-patterns.json").write_bytes(
+            (ROOT / ".github" / "sanitize-patterns.json").read_bytes()
+        )
+        source = workspace / "source"
+        source.mkdir()
+        script_path = workspace / "sanitize.sh"
+        script_path.write_bytes(self.sanitizer_script().encode("utf-8"))
+        unicode_line = "Build \u2713 \u2014 done\n".encode("utf-8")
+        (source / "deploy.log").write_bytes(
+            b"\x1b[32mINFO\x1b[0m [12:00:00]: \x1b[1;4mDriving the lane 'beta'\x1b[0m"
+            b"\x1b[?25l\x1b[2K\n"
+            b"Archive at /Users/runner/synthetic/App.xcarchive\n"
+            b"Using API key SYNTHKEY42 from issuer synthissuer\n"
+            b"Uploading com.example.synthetic to TestFlight\n"
+            + unicode_line
+            + b"\x1b[31m[!] Synthetic failure\x1b[0m\n"
+        )
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("LC_") and key != "LANG"
+        }
+        environment.update(
+            {
+                "LANG": "en_US.UTF-8",
+                "LC_ALL": "en_US.UTF-8",
+                "GITHUB_WORKSPACE": workspace.as_posix(),
+                "ASC_KEY_ID": "SYNTHKEY42",
+                "ASC_ISSUER_ID": "synthissuer",
+                "BUNDLE_ID": "com.example.synthetic",
+                "SCHEME_NAME": "",
+                "TEAM_ID": "",
+                "PROFILE_NAME": "",
+            }
+        )
+
+        result = subprocess.run(
+            ["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", script_path.as_posix()],
+            cwd=source,
+            env=environment,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn(b"RE error", result.stderr)
+        self.assertFalse((source / "deploy-sanitizing.tmp").exists())
+        self.assertFalse((source / "deploy-sanitizing.tmp.bak").exists())
+        sanitized = (source / "deploy-sanitized.log").read_bytes()
+        self.assertNotIn(b"\x1b", sanitized)
+        for leaked in (b"/Users/runner", b"SYNTHKEY42", b"synthissuer", b"com.example.synthetic"):
+            self.assertNotIn(leaked, sanitized)
+        self.assertEqual(
+            sanitized.splitlines(keepends=True),
+            [
+                b"INFO [12:00:00]: Driving the lane 'beta'\n",
+                b"Archive at <path>\n",
+                b"Using API key <asc-key-id> from issuer <asc-issuer-id>\n",
+                b"Uploading <bundle-id> to TestFlight\n",
+                unicode_line,
+                b"[!] Synthetic failure\n",
+            ],
+        )
+
+
 class WorkflowWiringTests(unittest.TestCase):
     def test_private_build_outputs_are_not_published(self):
         workflows = ROOT / ".github" / "workflows"
