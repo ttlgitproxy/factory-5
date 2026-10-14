@@ -592,7 +592,8 @@ jobs:
             exit 1
           fi
           # Remove terminal formatting before matching diagnostics or sensitive values.
-          sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' deploy.log > "$temp_log"
+          # LC_ALL=C keeps sed byte-oriented: macOS sed rejects these ranges under UTF-8 collation.
+          LC_ALL=C sed -E $'s/\033\\[[0-?]*[ -/]*[@-~]//g' deploy.log > "$temp_log"
           # @tsv doubles regex backslashes; join preserves the JSON-decoded expressions.
           static_patterns="$(jq -r '.static_patterns[] | [.match, .replace] | join("\t")' "$config_path")" || {
             echo "Failed to parse static_patterns from sanitizer config" >&2
@@ -608,7 +609,7 @@ jobs:
             fi
             match="${match//#/\\#}"
             replace="${replace//#/\\#}"
-            sed -i.bak -E "s#${match}#${replace}#g" "$temp_log"
+            LC_ALL=C sed -i.bak -E "s#${match}#${replace}#g" "$temp_log"
           done <<< "$static_patterns"
           while IFS= read -r var_name; do
             if [ -z "${var_name:-}" ]; then
