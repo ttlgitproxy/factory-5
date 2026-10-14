@@ -541,10 +541,119 @@ jobs:
 
           # Always capture test summary lines (suite/run results, not per-case)
           test_results="$(grep -E 'Test Suite|Executed|BUILD SUCCEEDED|✘|✔|Test run with|Suite .*passed|Suite .*failed|Test .*failed|Issue recorded' "$log_file" || true)"
+          error_pattern='\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find'
           if [ "${{ job.status }}" != "success" ]; then
-            # On failure, also capture error details
-            error_details="$(grep -E '\[!\]|error:|FAILED|fatal|Could not|BUILD FAILED|TEST FAILED|ARCHIVE FAILED|undefined symbol|linker error|linker command failed|ld:|cannot find' "$log_file" || true)"
-            extracted="$(printf '%s\n%s' "$error_details" "$test_results" | awk '!seen[$0]++')"
+            # On failure, list failing tests and their reasons before summaries, dropping
+            # per-test pass lines so they cannot crowd failures out of the 60-line excerpt.
+            if ! extracted="$(python3 - "$log_file" "$error_pattern" 2>/dev/null <<'PY'
+          import re
+          import sys
+
+          PASS, FAIL, PROGRESS, SKIP = "\u2714", "\u2718", "\u25c7", "\u279c"
+          DETAIL_PREFIXES = ("\u21b3", "\u00b1")
+          MAX_DETAIL_LINES = 5
+          MAX_UNFINISHED = 10
+          MAX_LINES, MAX_BYTES = 60, 7680
+
+          with open(sys.argv[1], "rb") as handle:
+              text = handle.read().decode("utf-8", "surrogateescape")
+          lines = [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+
+          error_re = re.compile(sys.argv[2])
+          failure_re = re.compile(
+              r"Test .*failed|Suite .*failed|Issue recorded|Fatal error|crashed"
+              r"|unexpected exit|encountered an error|execution time allowance|timed out"
+          )
+          block_re = re.compile(r"(Failing tests|Testing failed):$")
+          summary_re = re.compile(
+              r"Test Suite|Executed|BUILD SUCCEEDED|Test run with|Suite .*passed|Suite .*failed"
+          )
+          started_re = re.compile(PROGRESS + r" Test (?!run started\.$)(.+) started\.$")
+          finished_re = re.compile(
+              "(?:" + PASS + "|" + FAIL + "|" + SKIP + r") Test (.+) "
+              r"(?:(?:passed|failed) after [0-9]|skipped[.:])"
+          )
+          run_finished_re = re.compile(
+              "(?:" + PASS + "|" + FAIL + r") Test run with .* (?:passed|failed) after "
+          )
+
+          selected, chosen, seen = [], set(), set()
+
+
+          def take(index, dedupe=True):
+              line = lines[index]
+              if index in chosen or (dedupe and line in seen):
+                  return False
+              seen.add(line)
+              chosen.add(index)
+              selected.append(line)
+              return True
+
+
+          def is_progress(line):
+              return line.lstrip().startswith((PASS, PROGRESS, SKIP))
+
+
+          detail_budget, in_block = 0, False
+          for index, line in enumerate(lines):
+              if not line.strip():
+                  detail_budget, in_block = 0, False
+                  continue
+              if in_block and line.startswith((" ", "\t")):
+                  take(index)
+                  continue
+              in_block = False
+              if detail_budget and line.startswith(DETAIL_PREFIXES):
+                  take(index, dedupe=False)
+                  detail_budget -= 1
+                  continue
+              detail_budget = 0
+              if block_re.match(line):
+                  take(index)
+                  in_block = True
+              elif is_progress(line):
+                  continue
+              elif line.lstrip().startswith(FAIL):
+                  if take(index):
+                      detail_budget = MAX_DETAIL_LINES
+              elif error_re.search(line) or failure_re.search(line):
+                  take(index)
+
+          # Swift Testing tests that started but never finished point at a crash or hang.
+          if not any(run_finished_re.match(line) for line in lines):
+              running = {}
+              for index, line in enumerate(lines):
+                  started = started_re.match(line)
+                  if started:
+                      running[started.group(1)] = index
+                      continue
+                  finished = finished_re.match(line)
+                  if finished:
+                      running.pop(finished.group(1), None)
+              if running:
+                  selected.append("Tests started but not finished (possible crash or hang):")
+                  for index in sorted(running.values())[:MAX_UNFINISHED]:
+                      take(index)
+
+          for index, line in enumerate(lines):
+              if summary_re.search(line) and not is_progress(line):
+                  take(index)
+
+          # Keep whole lines with byte headroom so the cap applied after sanitizing
+          # rarely splits a multi-byte character.
+          output, size = [], 0
+          for line in selected[:MAX_LINES]:
+              size += len(line.encode("utf-8", "surrogateescape")) + 1
+              if output and size > MAX_BYTES:
+                  break
+              output.append(line)
+
+          sys.stdout.buffer.write("\n".join(output).encode("utf-8", "surrogateescape"))
+          PY
+            )"; then
+              error_details="$(grep -E "$error_pattern" "$log_file" || true)"
+              extracted="$(printf '%s\n%s' "$error_details" "$test_results" | awk '!seen[$0]++')"
+            fi
           else
             extracted="$test_results"
           fi
